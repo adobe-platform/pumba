@@ -1,9 +1,12 @@
 package action
 
 import (
+	"encoding/json"
 	"errors"
+	"fmt"
 	"math/rand"
 	"net"
+	"reflect"
 	"regexp"
 	"strconv"
 	"time"
@@ -28,6 +31,25 @@ const (
 	DefaultKillSignal = "SIGKILL"
 )
 
+// For unmarshalling JSON
+type Interval struct {
+	time.Duration
+}
+
+func (d *Interval) UnmarshalJSON(b []byte) (err error) {
+	if b[0] == '"' {
+		sd := string(b[1 : len(b)-1])
+		d.Duration, err = time.ParseDuration(sd)
+		return
+	}
+
+	var id int64
+	id, err = json.Number(string(b)).Int64()
+	d.Duration = time.Duration(id)
+
+	return
+}
+
 // CommandKill arguments for kill command
 type CommandKill struct {
 	Signal string
@@ -35,7 +57,7 @@ type CommandKill struct {
 
 // CommandPause arguments for pause command
 type CommandPause struct {
-	Duration time.Duration
+	Duration Interval
 	StopChan <-chan bool
 }
 
@@ -114,6 +136,9 @@ type CommandRemove struct {
 	Links   bool
 	Volumes bool
 }
+
+// CommandEndChaos arguments to stop chaos command
+type CommandEndChaos struct{}
 
 // A Chaos is the interface with different methods to stop runnig containers.
 type Chaos interface {
@@ -275,7 +300,7 @@ func removeContainers(client container.Client, containers []container.Container,
 	return nil
 }
 
-func pauseContainers(client container.Client, containers []container.Container, duration time.Duration, stopChan <-chan bool) error {
+func pauseContainers(client container.Client, containers []container.Container, duration Interval, stopChan <-chan bool) error {
 	var err error
 	pausedContainers := []container.Container{}
 	if RandomMode {
@@ -302,7 +327,7 @@ func pauseContainers(client container.Client, containers []container.Container, 
 	case <-stopChan:
 		log.Debugf("Unpause containers by stop event")
 		err = unpauseContainers(client, pausedContainers)
-	case <-time.After(duration):
+	case <-time.After(duration.Duration):
 		log.Debugf("Unpause containers after: %s", duration)
 		err = unpauseContainers(client, pausedContainers)
 	}
@@ -387,6 +412,7 @@ func (p pumbaChaos) KillContainers(client container.Client, names []string, patt
 	log.Info("Kill containers")
 	// get command details
 	command, ok := cmd.(CommandKill)
+	log.Debugf("command: %s, ok: %s", command, ok)
 	if !ok {
 		return errors.New("Unexpected cmd type; should be CommandKill")
 	}
@@ -546,4 +572,52 @@ func (p pumbaChaos) PauseContainers(client container.Client, names []string, pat
 		return err
 	}
 	return pauseContainers(client, containers, command.Duration, command.StopChan)
+}
+
+// Return struct specified by structName, filled in with values.
+func CommandStructByName(structName string, messageJson *string, stopChannel chan bool) (interface{}, error) {
+	commandRegister := map[string]interface{}{
+		"kill":             &CommandKill{},
+		"pause":            &CommandPause{StopChan: stopChannel},
+		"netemdelay":       &CommandNetemDelay{StopChan: stopChannel},
+		"netemlossrandom":  &CommandNetemLossRandom{StopChan: stopChannel},
+		"netemlossstate":   &CommandNetemLossState{StopChan: stopChannel},
+		"netemlossgemodel": &CommandNetemLossGEmodel{StopChan: stopChannel},
+		"netemrate":        &CommandNetemRate{StopChan: stopChannel},
+		"stop":             &CommandStop{},
+		"remove":           &CommandRemove{},
+		"endchaos":         &CommandEndChaos{},
+	}
+	cmdStruct, ok := commandRegister[structName]
+	if !ok {
+		return nil, fmt.Errorf("No such command: %s", structName)
+	}
+	err := json.Unmarshal([]byte(*messageJson), cmdStruct)
+	if err != nil {
+		return nil, err
+	}
+	switch tt := cmdStruct.(type) {
+	case *CommandKill:
+		return *tt, nil
+	case *CommandPause:
+		return *tt, nil
+	case *CommandNetemDelay:
+		return *tt, nil
+	case *CommandNetemLossRandom:
+		return *tt, nil
+	case *CommandNetemLossState:
+		return *tt, nil
+	case *CommandNetemLossGEmodel:
+		return *tt, nil
+	case *CommandNetemRate:
+		return *tt, nil
+	case *CommandStop:
+		return *tt, nil
+	case *CommandRemove:
+		return *tt, nil
+	case *CommandEndChaos:
+		return *tt, nil
+	}
+
+	return nil, fmt.Errorf("BUG: Type assertion failed for ", reflect.TypeOf(cmdStruct))
 }

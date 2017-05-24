@@ -9,7 +9,8 @@ FROM golang:1.8-alpine AS builder
 RUN apk add --no-cache git bash curl && \
     go get -v github.com/mitchellh/gox && \
     go get -v github.com/aktau/github-release && \
-    go get -v github.com/jstemmer/go-junit-report
+    go get -v github.com/jstemmer/go-junit-report && \
+    go get -v github.com/aws/aws-sdk-go
 
 # set working directory
 RUN mkdir -p /go/src/github.com/gaia-adm/pumba

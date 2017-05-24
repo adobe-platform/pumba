@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/ioutil"
@@ -18,6 +19,7 @@ import (
 	log "github.com/Sirupsen/logrus"
 	"github.com/gaia-adm/pumba/action"
 	"github.com/gaia-adm/pumba/container"
+	"github.com/gaia-adm/pumba/listener"
 
 	"github.com/urfave/cli"
 
@@ -93,6 +95,13 @@ const (
 	// DefaultInterface default network interface
 	DefaultInterface = "eth0"
 )
+
+// Convert Message from json
+type MsgFormat struct {
+	Command  string
+	Interval string
+	Dry      bool
+}
 
 func contains(slice []string, item string) bool {
 	set := make(map[string]struct{}, len(slice))
@@ -362,8 +371,26 @@ func main() {
 			},
 			Usage:       "remove containers",
 			ArgsUsage:   "containers (name, list of names, RE2 regex)",
-			Description: "remove target containers, with links and voluems",
+			Description: "remove target containers, with links and volumes",
 			Action:      remove,
+			Before:      beforeCommand,
+		},
+		{
+			Name: "sqs",
+			Flags: []cli.Flag{
+				cli.StringFlag{
+					Name:  "queue, q",
+					Usage: "SQS queue name",
+				},
+				cli.StringFlag{
+					Name:  "timeout, t",
+					Usage: "SQS polling timeout",
+				},
+			},
+			Usage:       "poll SQS queue for commands",
+			ArgsUsage:   "containers (name, list of names, RE2 regex)",
+			Description: "poll SQS queue for commands and execute them on the container",
+			Action:      sqs,
 			Before:      beforeCommand,
 		},
 	}
@@ -471,14 +498,8 @@ func before(c *cli.Context) error {
 // beforeCommand run before each chaos command
 func beforeCommand(c *cli.Context) error {
 	// get recurrent time interval
-	if intervalString := c.GlobalString("interval"); intervalString == "" {
-		log.Debug("No interval, running only once")
-	} else if interval, err := time.ParseDuration(intervalString); err != nil {
-		return err
-	} else {
-		gInterval = interval
-	}
-	return nil
+	err := setInterval(c.GlobalString("interval"))
+	return err
 }
 
 func getNamesOrPattern(c *cli.Context) ([]string, string) {
@@ -855,7 +876,7 @@ func pause(c *cli.Context) error {
 		return err
 	}
 	cmd := action.CommandPause{
-		Duration: duration,
+		Duration: action.Interval{duration},
 		StopChan: gStopChan,
 	}
 	runChaosCommand(cmd, names, pattern, chaos.PauseContainers)
@@ -889,6 +910,31 @@ func stop(c *cli.Context) error {
 	return nil
 }
 
+// SQS Command
+func sqs(c *cli.Context) error {
+	var timeout int64 = 20
+	var validMessage bool
+	var messageBodyMD5 string
+	validMessageCh := make(chan bool, 1)
+	// poll SQS
+	for {
+		message := listener.SQS_longpolling_receive_message(c.String("queue"), timeout, &messageBodyMD5)
+		if *message != "" {
+			// If a valid message has already been received, stop previously running chaos.
+			if validMessage == true {
+				log.Info("Stopping Previous Chaos")
+				gStopChan <- true
+				gWG.Wait()
+				gStopChan <- false
+			}
+			go runCommandFromMessage(message, c, validMessageCh)
+			validMessage = <-validMessageCh
+			time.Sleep(time.Duration(1) * time.Minute)
+		}
+	}
+	return nil
+}
+
 func handleSignals() {
 	// Graceful shut-down on SIGINT/SIGTERM
 	sigs := make(chan os.Signal, 1)
@@ -902,7 +948,7 @@ func handleSignals() {
 		sid := <-sigs
 		log.Debugf("Recieved signal: %d", sid)
 		gStopChan <- true
-		log.Debug("Sending stop signal to runnung chaos commands ...")
+		log.Debug("Sending stop signal to running chaos commands ...")
 		gWG.Wait()
 		log.Debug("Graceful exit :-)")
 		os.Exit(1)
@@ -968,4 +1014,88 @@ func parseRate(rate string) (string, error) {
 		return "", err
 	}
 	return rate, nil
+}
+
+func runCommandFromMessage(messageJson *string, c *cli.Context, validMessageCh chan bool) {
+	// get names or pattern
+	names, pattern := getNamesOrPattern(c)
+
+	var message MsgFormat
+
+	methodRegister := map[string]func(container.Client, []string, string, interface{}) error{
+		"kill":             chaos.KillContainers,
+		"pause":            chaos.PauseContainers,
+		"netemdelay":       chaos.NetemDelayContainers,
+		"netemlossrandom":  chaos.NetemLossRandomContainers,
+		"netemlossstate":   chaos.NetemLossStateContainers,
+		"netemlossgemodel": chaos.NetemLossGEmodelContainers,
+		"netemrate":        chaos.NetemRateContainers,
+		"stop":             chaos.StopContainers,
+		"remove":           chaos.RemoveContainers,
+	}
+
+	err := json.Unmarshal([]byte(*messageJson), &message)
+	if err != nil {
+		log.Error(err)
+		validMessageCh <- false
+		return
+	}
+
+	log.Debugf("Message: %s", message)
+
+	// Set Options
+	err = setOptions(message)
+	if err != nil {
+		log.Error(err)
+		validMessageCh <- false
+		return
+	}
+
+	// Determine cmd struct to use and run the command
+	commandName := strings.ToLower(message.Command)
+	cmd, err := action.CommandStructByName(commandName, messageJson, gStopChan)
+	if err != nil {
+		log.Error(err)
+		validMessageCh <- false
+		return
+	}
+	log.Debugf("Command %+v", cmd)
+
+	// End Chaos
+	_, ok := cmd.(action.CommandEndChaos)
+	if ok == true {
+		validMessageCh <- false
+		return
+	}
+	// Message is valid, restart sqs polling
+	validMessageCh <- true
+
+	// Determine chaos function from message
+	chaosMethod := methodRegister[commandName]
+
+	runChaosCommand(cmd, names, pattern, chaosMethod)
+	return
+}
+
+// Set global options from message
+func setOptions(message MsgFormat) error {
+	var err error
+	log.Info("Message: ", message)
+	err = setInterval(message.Interval)
+	if err != nil {
+		return err
+	}
+	action.DryMode = message.Dry
+	return nil
+}
+
+func setInterval(intervalString string) error {
+	if intervalString == "" {
+		log.Debug("No interval, running only once")
+	} else if interval, err := time.ParseDuration(intervalString); err != nil {
+		return err
+	} else {
+		gInterval = interval
+	}
+	return nil
 }
